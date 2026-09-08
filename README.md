@@ -1,3 +1,18 @@
+> [!IMPORTANT]
+> **This is a fork of [asterinas/asterinas](https://github.com/asterinas/asterinas)**
+> maintained by the [linuxdeepin](https://github.com/linuxdeepin) organization
+> for desktop application adaptation.
+>
+> It does not necessarily track the official repository in real time,
+> and may carry UOS/deepin-specific patches.
+> For official docs, releases and issues, see the
+> [upstream project](https://github.com/asterinas/asterinas).
+>
+> 本仓库是 [linuxdeepin](https://github.com/linuxdeepin) 组织维护的 Asterinas 分支，
+> 用于桌面应用适配。
+> 它可能不会实时追踪官方仓库，且有可能包含 UOS/deepin 特定补丁。
+> 官方文档、发布与 Issue 请见[上游项目](https://github.com/asterinas/asterinas)。
+
 <p align="center">
     <img src="book/src/images/logo_en.svg" alt="asterinas-logo" width="620"><br>
     Toward a production-grade Linux alternative—memory safe, high-performance, and more<br/>
