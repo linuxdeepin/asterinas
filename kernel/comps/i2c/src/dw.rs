@@ -83,7 +83,9 @@ impl DesignWareI2c {
         let tx_fifo_depth = Self::tx_fifo_depth(&io_mem);
         ostd::info!(
             "{}: mapped {:?}, TX FIFO depth {}",
-            name, phys, tx_fifo_depth
+            name,
+            phys,
+            tx_fifo_depth
         );
         Ok(Self {
             name: name.to_string(),
@@ -169,7 +171,9 @@ impl DesignWareI2c {
         if hcnt == 0 || lcnt == 0 {
             ostd::info!(
                 "{}: FS_SCL timing unset (hcnt={:#x}, lcnt={:#x}), using 100 MHz fallback",
-                self.name, hcnt, lcnt
+                self.name,
+                hcnt,
+                lcnt
             );
             self.write_reg(regs::FS_SCL_HCNT, 0x57);
             self.write_reg(regs::FS_SCL_LCNT, 0x9f);
@@ -193,7 +197,9 @@ impl DesignWareI2c {
         if total > MAX_TRANSFER_BYTES {
             ostd::warn!(
                 "{}: transfer of {} bytes exceeds the {} byte limit",
-                self.name, total, MAX_TRANSFER_BYTES
+                self.name,
+                total,
+                MAX_TRANSFER_BYTES
             );
             return Err(Error::IoError);
         }
@@ -305,7 +311,11 @@ impl DesignWareI2c {
         };
         ostd::warn!(
             "{}: transfer to {:#04x} failed: RAW_INTR_STAT={:#x}, TX_ABRT_SOURCE={:#x} ({})",
-            self.name, target_addr, raw, abort, reason
+            self.name,
+            target_addr,
+            raw,
+            abort,
+            reason
         );
     }
 }

@@ -6,8 +6,12 @@ edition.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [target.x86_64-unknown-none.dependencies]
+aster-core.workspace = true
+aster-input.workspace = true
+aster-time.workspace = true
 component.workspace = true
 ostd.workspace = true
+spin.workspace = true
 
 [lints]
 workspace = true

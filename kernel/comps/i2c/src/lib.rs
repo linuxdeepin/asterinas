@@ -23,12 +23,17 @@ macro_rules! __log_prefix {
     };
 }
 
+mod controller;
 mod device;
 mod dw;
+mod hid_report;
+mod i2c_hid;
+mod input_dev;
 
 use component::{ComponentInitError, init_component};
 
 #[init_component(kthread)]
 fn init() -> Result<(), ComponentInitError> {
+    controller::start();
     Ok(())
 }
