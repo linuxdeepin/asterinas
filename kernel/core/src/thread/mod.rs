@@ -11,7 +11,10 @@ use ostd::{
     task::Task,
 };
 
-use self::{kernel_thread::AsKernelThread, stats::CONTEXT_SWITCH_COUNTER};
+use self::{
+    kernel_thread::{AsKernelThread, ThreadOptions},
+    stats::CONTEXT_SWITCH_COUNTER,
+};
 use crate::{
     prelude::*,
     sched::{SchedAttr, SchedPolicy},
@@ -28,6 +31,16 @@ pub(crate) mod work_queue;
 pub(crate) use self::stats::collect_context_switch_count;
 
 pub(crate) type Tid = u32;
+
+/// Spawns a kernel thread that runs `f` under the default fair scheduling
+/// policy.
+///
+/// High-level components must use this function to create kernel threads: a
+/// raw OSTD task carries no kernel thread data, so the kernel scheduler's
+/// enqueue drops it and the task never runs.
+pub fn spawn_kernel_thread(f: impl FnOnce() + Send + 'static) {
+    ThreadOptions::new(f).spawn();
+}
 
 fn pre_schedule_handler(irq_guard: &DisabledLocalIrqGuard) {
     let Some(task) = Task::current() else {
