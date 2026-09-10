@@ -61,6 +61,9 @@ mod time;
 
 /// Spawns a kernel thread that runs the given function.
 pub use crate::thread::spawn_kernel_thread;
+
+/// Suspends the current task for the given duration.
+pub use crate::time::sleep;
 mod util;
 // TODO: Add vDSO support for other architectures.
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]

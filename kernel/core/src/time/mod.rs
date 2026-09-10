@@ -10,6 +10,22 @@ pub(crate) use timer::{Timer, TimerManager};
 
 use crate::prelude::*;
 
+/// Suspends the current task for `duration` on the monotonic clock.
+///
+/// This is the kernel-thread counterpart of `clock_nanosleep`: unlike busy
+/// waiting with `Task::yield_now`, the task is dequeued and woken by the
+/// timer expiry, so it consumes no CPU while sleeping.
+pub fn sleep(duration: Duration) {
+    use ostd::sync::Waiter;
+
+    let waiter = Waiter::new_pair().0;
+    let timer_manager = clocks::MonotonicClock::timer_manager();
+    let _ = waiter.pause_until_or_timeout(
+        || Option::<()>::None,
+        wait::ManagedTimeout::new_with_manager(timer::Timeout::After(duration), timer_manager),
+    );
+}
+
 pub(crate) mod clocks;
 mod core;
 pub(crate) mod cpu_time_stats;
