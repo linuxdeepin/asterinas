@@ -24,7 +24,6 @@ macro_rules! __log_prefix {
 }
 
 mod controller;
-mod device;
 mod dw;
 mod hid_report;
 mod i2c_hid;
