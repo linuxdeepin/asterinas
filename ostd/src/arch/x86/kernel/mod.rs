@@ -9,4 +9,4 @@ pub(super) mod acpi;
 pub(super) mod apic;
 pub(super) mod tsc;
 
-pub use acpi::{ACPI_INFO, AcpiInfo};
+pub use acpi::{ACPI_INFO, AcpiInfo, dsdt_aml_bytes};
