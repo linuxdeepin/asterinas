@@ -99,6 +99,30 @@ pub(crate) fn get_acpi_tables() -> Option<&'static AcpiTables<AcpiMemoryHandler>
     acpi_tables.0.as_ref()
 }
 
+/// Returns the raw AML byte stream of the Differentiated System Description
+/// Table (DSDT), if the table is present.
+///
+/// The bytes exclude the SDT header and stay valid for `'static`: they are
+/// read through the direct mapping of the table's physical memory, which is
+/// never unmapped or modified.
+pub fn dsdt_aml_bytes() -> Option<&'static [u8]> {
+    use core::slice;
+
+    let tables = get_acpi_tables()?;
+    let aml_table = tables.dsdt().ok()?;
+    // SAFETY: `AmlTable::address` points at the start of the DSDT AML stream
+    // in physical memory. ACPI tables live in reserved memory that the
+    // firmware hands off to the kernel and that nothing in the kernel reuses,
+    // and the direct mapping exposes it for reads for as long as the kernel
+    // runs.
+    Some(unsafe {
+        slice::from_raw_parts(
+            paddr_to_vaddr(aml_table.address) as *const u8,
+            aml_table.length as usize,
+        )
+    })
+}
+
 /// The platform information provided by the ACPI tables.
 ///
 /// Currently, this structure contains only a limited set of fields, far fewer than those in all
