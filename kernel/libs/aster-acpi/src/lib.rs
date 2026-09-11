@@ -19,3 +19,19 @@
 extern crate alloc;
 
 pub mod pkg;
+
+use alloc::vec::Vec;
+
+mod namespace;
+
+pub use namespace::{AmlDevice, ObjectValue};
+
+/// Parses an AML stream and returns the devices it declares, in declaration
+/// order.
+///
+/// The stream is the AML payload of a DSDT or SSDT, i.e. the table bytes
+/// without the SDT header. Devices whose `_STA` object reports the status
+/// `0x0` are still returned; filtering by presence is the caller's decision.
+pub fn devices(aml: &[u8]) -> Vec<AmlDevice> {
+    namespace::parse_devices(aml)
+}
