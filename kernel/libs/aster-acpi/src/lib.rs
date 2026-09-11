@@ -23,8 +23,10 @@ pub mod pkg;
 use alloc::vec::Vec;
 
 mod namespace;
+mod resource;
 
 pub use namespace::{AmlDevice, ObjectValue};
+pub use resource::Resource;
 
 /// Parses an AML stream and returns the devices it declares, in declaration
 /// order.
@@ -34,4 +36,9 @@ pub use namespace::{AmlDevice, ObjectValue};
 /// `0x0` are still returned; filtering by presence is the caller's decision.
 pub fn devices(aml: &[u8]) -> Vec<AmlDevice> {
     namespace::parse_devices(aml)
+}
+
+/// Decodes a chain of resource descriptors, as stored in a `_CRS` buffer.
+pub fn parse_resource_buffer(buf: &[u8]) -> Vec<Resource> {
+    resource::parse_resource_buffer(buf)
 }
