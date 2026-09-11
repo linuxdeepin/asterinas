@@ -44,6 +44,7 @@ members = [
     "kernel/core/comps/systree",
     "kernel/core/comps/time",
     "kernel/core/comps/virtio",
+    "kernel/libs/aster-acpi",
     "kernel/libs/aster-bigtcp",
     "kernel/libs/aster-fuse",
     "kernel/libs/aster-rights",
@@ -95,6 +96,7 @@ default-members = [
     "kernel/core/comps/systree",
     "kernel/core/comps/time",
     "kernel/core/comps/virtio",
+    "kernel/libs/aster-acpi",
     "kernel/libs/aster-bigtcp",
     "kernel/libs/aster-fuse",
     "kernel/libs/aster-util",
@@ -179,6 +181,7 @@ aster-time = { path = "kernel/core/comps/time" }
 aster-virtio = { path = "kernel/core/comps/virtio" }
 
 # Crates under kernel/libs
+aster-acpi = { path = "kernel/libs/aster-acpi" }
 aster-bigtcp = { path = "kernel/libs/aster-bigtcp" }
 aster-fuse = { path = "kernel/libs/aster-fuse" }
 aster-rights = { path = "kernel/libs/aster-rights" }
