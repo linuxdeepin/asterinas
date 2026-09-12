@@ -204,7 +204,7 @@ pub(in crate::fs) trait SysTreeInodeTy: Send + Sync + 'static {
             if sysnode.is_attr_absent(name) {
                 return_errno_with_message!(Errno::ENOENT, "attribute is not present");
             }
-            let Some(attr) = sysnode.node_attrs().get(name) else {
+            let Some(attr) = sysnode.node_attrs().get(name).cloned() else {
                 return_errno_with_message!(Errno::ENOENT, "child node or attribute not found");
             };
 
@@ -219,12 +219,7 @@ pub(in crate::fs) trait SysTreeInodeTy: Send + Sync + 'static {
                 }
             };
 
-            let inode = Self::new_attr(
-                attr.clone(),
-                parent_node_arc,
-                Arc::downgrade(&self.this()),
-                &sb,
-            );
+            let inode = Self::new_attr(attr, parent_node_arc, Arc::downgrade(&self.this()), &sb);
             Ok(inode)
         }
     }
@@ -237,7 +232,7 @@ pub(in crate::fs) trait SysTreeInodeTy: Send + Sync + 'static {
         if sysnode.is_attr_absent(name) {
             return_errno_with_message!(Errno::ENOENT, "attribute is not present");
         }
-        let Some(attr) = sysnode.node_attrs().get(name) else {
+        let Some(attr) = sysnode.node_attrs().get(name).cloned() else {
             return_errno_with_message!(Errno::ENOENT, "child node or attribute not found");
         };
 
@@ -250,12 +245,7 @@ pub(in crate::fs) trait SysTreeInodeTy: Send + Sync + 'static {
         };
 
         let sb = self.fs().sb();
-        let inode = Self::new_attr(
-            attr.clone(),
-            leaf_node_arc,
-            Arc::downgrade(&self.this()),
-            &sb,
-        );
+        let inode = Self::new_attr(attr, leaf_node_arc, Arc::downgrade(&self.this()), &sb);
         Ok(inode)
     }
 
@@ -265,9 +255,9 @@ pub(in crate::fs) trait SysTreeInodeTy: Send + Sync + 'static {
     {
         match &self.node_kind() {
             SysTreeNodeKind::Branch(branch_node) => {
-                let attrs = branch_node.node_attrs();
+                let attrs = branch_node.node_attrs().to_vec();
                 let attr_iter = AttrDentryIter::new(
-                    Some((attrs.iter(), branch_node.as_ref())),
+                    Some((attrs.into_iter(), branch_node.as_ref())),
                     self.metadata().ino,
                     min_ino,
                 );
@@ -277,9 +267,9 @@ pub(in crate::fs) trait SysTreeInodeTy: Send + Sync + 'static {
                 attr_iter.chain(node_iter).chain(special_iter)
             }
             SysTreeNodeKind::Leaf(leaf_node) => {
-                let attrs = leaf_node.node_attrs();
+                let attrs = leaf_node.node_attrs().to_vec();
                 let attr_iter = AttrDentryIter::new(
-                    Some((attrs.iter(), leaf_node.as_ref())),
+                    Some((attrs.into_iter(), leaf_node.as_ref())),
                     self.metadata().ino,
                     min_ino,
                 );
@@ -634,13 +624,13 @@ impl<KInode: SysTreeInodeTy + Send + Sync + 'static> Inode for KInode {
 }
 
 // Update AttrDentryIter to filter by min_ino
-struct AttrDentryIter<'a, I: Iterator<Item = &'a SysAttr>> {
+struct AttrDentryIter<'a, I: Iterator<Item = SysAttr>> {
     attrs_and_node: Option<(I, &'a dyn SysNode)>,
     dir_ino: Ino,
     min_ino: Ino,
 }
 
-impl<'a, I: Iterator<Item = &'a SysAttr>> AttrDentryIter<'a, I> {
+impl<'a, I: Iterator<Item = SysAttr>> AttrDentryIter<'a, I> {
     fn new(attrs_and_node: Option<(I, &'a dyn SysNode)>, dir_ino: Ino, min_ino: Ino) -> Self {
         Self {
             attrs_and_node,
@@ -650,7 +640,7 @@ impl<'a, I: Iterator<Item = &'a SysAttr>> AttrDentryIter<'a, I> {
     }
 }
 
-impl<'a, I: Iterator<Item = &'a SysAttr>> Iterator for AttrDentryIter<'a, I> {
+impl<'a, I: Iterator<Item = SysAttr>> Iterator for AttrDentryIter<'a, I> {
     type Item = Dentry;
 
     fn next(&mut self) -> Option<Dentry> {
