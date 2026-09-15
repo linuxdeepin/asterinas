@@ -239,6 +239,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-i2c"
+version = "0.1.0"
+dependencies = [
+ "aster-device",
+ "component",
+ "ostd",
+ "spin",
+]
+
+[[package]]
 name = "aster-i8042"
 version = "0.1.0"
 dependencies = [
@@ -453,6 +463,7 @@ name = "asterinas"
 version = "0.1.0"
 dependencies = [
  "aster-core",
+ "aster-i2c",
  "aster-uart",
  "ostd",
 ]

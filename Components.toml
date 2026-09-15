@@ -6,6 +6,7 @@ console = { name = "aster-console" }
 core = { name = "aster-core" }
 device = { name = "aster-device" }
 framebuffer = { name = "aster-framebuffer" }
+i2c = { name = "aster-i2c" }
 i8042 = { name = "aster-i8042" }
 input = { name = "aster-input" }
 logger = { name = "aster-logger" }
