@@ -242,6 +242,8 @@ dependencies = [
 name = "aster-i2c"
 version = "0.1.0"
 dependencies = [
+ "aster-acpi",
+ "aster-core",
  "aster-device",
  "component",
  "ostd",
