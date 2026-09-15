@@ -251,6 +251,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-i2c-hid"
+version = "0.1.0"
+dependencies = [
+ "aster-core",
+ "aster-device",
+ "aster-i2c",
+ "aster-input",
+ "component",
+ "ostd",
+]
+
+[[package]]
 name = "aster-i8042"
 version = "0.1.0"
 dependencies = [
@@ -466,6 +478,7 @@ version = "0.1.0"
 dependencies = [
  "aster-core",
  "aster-i2c",
+ "aster-i2c-hid",
  "aster-uart",
  "ostd",
 ]

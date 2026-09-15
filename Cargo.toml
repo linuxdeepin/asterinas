@@ -28,6 +28,7 @@ members = [
     "ostd/libs/padding-struct",
     "kernel",
     "kernel/comps/i2c",
+    "kernel/comps/i2c-hid",
     "kernel/comps/uart",
     "kernel/core",
     "kernel/core/comps/block",
@@ -83,6 +84,7 @@ default-members = [
     "ostd",
     "kernel",
     "kernel/comps/i2c",
+    "kernel/comps/i2c-hid",
     "kernel/comps/uart",
     "kernel/core",
     "kernel/core/comps/block",
@@ -168,6 +170,7 @@ aster-core = { path = "kernel/core", default-features = false }
 
 # Crates under kernel/comps
 aster-i2c = { path = "kernel/comps/i2c" }
+aster-i2c-hid = { path = "kernel/comps/i2c-hid" }
 aster-uart = { path = "kernel/comps/uart" }
 
 # Crates under kernel/core/comps
