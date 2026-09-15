@@ -37,7 +37,7 @@ pub(crate) use private::Sealed;
 /// The trait is sealed: only this crate implements it, and therefore only
 /// this crate implements [`AnyDevice`](crate::AnyDevice). The operations that
 /// edit a container's children are not on this trait; they are on the
-/// crate-private [`SysTreeEdit`], which no trait object reachable from outside
+/// crate-private `SysTreeEdit`, which no trait object reachable from outside
 /// the crate provides.
 pub trait Container: SysBranchNode + Sealed {}
 
