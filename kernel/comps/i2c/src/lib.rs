@@ -102,12 +102,12 @@ fn register_clients(devices: &[AmlDevice], adapters: &[(String, Arc<I2cAdapter>)
     for client in acpi::hid_over_i2c_clients(devices) {
         let Some((_, adapter)) = adapters
             .iter()
-            .find(|(path, _)| *path == client.controller_path)
+            .find(|(path, _)| Some(path.as_str()) == client.parent.as_deref())
         else {
             ostd::warn!(
-                "client at {:#04x} hangs off controller {}, which did not come up, skipping",
+                "touchpad at {:#04x} hangs off controller {:?}, which did not come up, skipping",
                 client.address,
-                client.controller_path
+                client.parent
             );
             continue;
         };
