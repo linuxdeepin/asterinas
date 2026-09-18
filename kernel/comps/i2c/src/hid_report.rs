@@ -38,8 +38,6 @@ pub struct Field {
 pub struct ReportLayout {
     pub report_id: u8,
     pub fields: Vec<Field>,
-    /// Size of the report payload in bytes, used to size input reads.
-    pub payload_bytes: usize,
 }
 
 /// Global item state, saved and restored by `Push`/`Pop` items.
@@ -138,27 +136,27 @@ pub fn parse_mouse_report(desc: &[u8]) -> Option<ReportLayout> {
                 let usages = expand_usages(&local.usages, local.usage_min, local.usage_max);
                 local = LocalState::default();
 
-                if global.report_count == 0 || usages.is_empty() {
-                    continue;
-                }
-                // Constant fields are padding and never carry a value.
-                if flags & input_flags::CONSTANT != 0 {
-                    continue;
-                }
                 let report = report_mut(&mut reports, global.report_id);
-                for (k, usage) in usages.iter().enumerate() {
-                    let offset = report.bit_offset + k * global.report_size;
-                    if let Some(kind) = field_kind(global.usage_page, *usage, flags) {
-                        report.fields.push(Field {
-                            kind,
-                            offset,
-                            size: global.report_size,
-                            signed: global.logical_min < 0,
-                        });
-                        match kind {
-                            FieldKind::RelX => report.has_rel_x = true,
-                            FieldKind::RelY => report.has_rel_y = true,
-                            _ => {}
+                // Only data items with a positive count carry a value;
+                // constant (padding) items never do. Both still occupy
+                // `Report Size x Report Count` bits of the payload, so the
+                // offset of every later field accounts for them — skipping
+                // that advance was what misaligned the axes.
+                if global.report_count > 0 && flags & input_flags::CONSTANT == 0 {
+                    for (k, usage) in usages.iter().enumerate() {
+                        let offset = report.bit_offset + k * global.report_size;
+                        if let Some(kind) = field_kind(global.usage_page, *usage, flags) {
+                            report.fields.push(Field {
+                                kind,
+                                offset,
+                                size: global.report_size,
+                                signed: global.logical_min < 0,
+                            });
+                            match kind {
+                                FieldKind::RelX => report.has_rel_x = true,
+                                FieldKind::RelY => report.has_rel_y = true,
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -168,19 +166,17 @@ pub fn parse_mouse_report(desc: &[u8]) -> Option<ReportLayout> {
         }
     }
 
-    let layout = reports.iter().find(|r| r.has_pointer()).map(|r| {
-        let payload_bits = r.bit_offset;
-        ReportLayout {
+    let layout = reports
+        .iter()
+        .find(|r| r.has_pointer())
+        .map(|r| ReportLayout {
             report_id: r.report_id,
             fields: r.fields.clone(),
-            payload_bytes: payload_bits.div_ceil(8),
-        }
-    });
+        });
     if let Some(layout) = &layout {
         ostd::info!(
-            "report descriptor: mouse report id={} payload={} bytes, {} fields",
+            "report descriptor: mouse report id={}, {} fields",
             layout.report_id,
-            layout.payload_bytes,
             layout.fields.len()
         );
     } else {
