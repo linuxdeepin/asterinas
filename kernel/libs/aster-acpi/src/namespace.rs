@@ -1,49 +1,53 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Static parsing of the ACPI namespace.
+//! A pattern-scan parser for device declarations in an AML stream.
 //!
-//! This module walks the `Scope` and `Device` structure of an AML stream and
-//! collects, for every device, the values of the named objects it declares:
-//! `_HID`, `_CID`, `_STA`, `_CRS`, and any other object the firmware happens
-//! to declare. Only the declarative subset of AML is understood; a term list
-//! that contains anything else aborts the walk rather than risk a
-//! misparse — the caller can still use the devices found so far.
+//! Instead of walking the AML term list sequentially (which requires
+//! understanding every AML opcode), this module scans the raw bytes for the
+//! `5b 82` DeviceOp pattern. At each match it reads the PkgLength to find
+//! the device body extent, validates the four-character name, and only then
+//! scans the body for the named objects that carry hardware descriptions:
+//! `_HID`, `_CID`, and `_CRS`. A match whose name is not a valid NameSeg is
+//! treated as coincidental data (a `5b 82` pair inside a method body or a
+//! buffer) and skipped byte-wise, never trusted to locate a device boundary.
+//!
+//! Devices nest in AML; the scanner keeps a stack of open device bodies so
+//! that a nested declaration (a touchpad inside its I2C controller, as
+//! firmware commonly emits) becomes its own device with a full path, and
+//! its named objects are not attributed to the parent.
+//!
+//! Method bodies are skipped whole. The one pattern decoded is the trivial
+//! `_CRS` accessor firmware emits for a static resource template:
+//! `Method(_CRS) { Return(SCCG) }`, which resolves to the named buffer the
+//! method returns.
+//!
+//! The parser must never panic on firmware bytes: every read is
+//! bounds-checked, and a value that does not fit its declared body is
+//! rejected rather than sliced. A crash during boot-time enumeration is
+//! far more costly than a missed device.
 //!
 //! Reference: <https://download.intel.com/download/idptools/61122v004.pdf>,
-//! section 20.2.2 ("Term Lists Encoding") and section 19.6 for the object
-//! types; the Linux counterpart of the walk is
-//! <https://elixir.bootlin.com/linux/v6.16/source/drivers/acpi/acpi_bus.c>
-//! (`acpi_walk_namespace` on the device type nodes).
+//! section 20 ("ACPI Machine Language (AML) Specification").
 
 use alloc::{
     collections::BTreeMap,
+    format,
     string::{String, ToString},
     vec::Vec,
 };
 
-use super::pkg::{AmlError, AmlStream, opcode};
-
-/// The value of a named object, as declared in the namespace.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ObjectValue {
-    /// An ASCII string, e.g. `Name(_HID, "BLTP7853")`.
-    Str(String),
-    /// An integer, e.g. `Method(_STA) { Return(0x0f) }`.
-    Int(u64),
-    /// A byte buffer, e.g. the resource template of `_CRS`.
-    Buf(Vec<u8>),
-    /// A value the static parser does not model (an unresolved reference, a
-    /// package, ...). Present so that the declaration still counts as seen.
-    Opaque,
-}
-
-/// A device node declared in the namespace.
+/// A device node found in the AML stream.
 #[derive(Clone, Debug)]
 pub struct AmlDevice {
     /// The four-character device name, e.g. `I2CA`.
     pub name: String,
-    /// The absolute path, e.g. `\\_SB.I2CA`.
+    /// The absolute path, e.g. `\_SB.I2CA`.
     pub path: String,
+    /// The absolute path of the enclosing device, or `None` when the device
+    /// sits directly in a scope. A touchpad declared inside its I2C
+    /// controller carries the controller here — the same bus attachment the
+    /// resource source string denotes in display form.
+    pub parent: Option<String>,
     /// The values of the named objects declared by the device, keyed by
     /// object name (`_HID`, `_CID`, `_CRS`, `_STA`, ...).
     pub objects: BTreeMap<String, ObjectValue>,
@@ -52,11 +56,6 @@ pub struct AmlDevice {
 impl AmlDevice {
     /// Returns the hardware ID: the string value of `_HID`, decoding the
     /// compressed EISA form when the firmware stored an integer.
-    ///
-    /// Reference:
-    /// <https://elixir.bootlin.com/linux/v6.16/source/drivers/acpi/scan.c>
-    /// (`acpi_device_hid` over the packed form decoded by
-    /// `acpi_eisa_id_to_string`).
     pub fn hid(&self) -> Option<String> {
         match self.objects.get("_HID")? {
             ObjectValue::Str(s) => Some(s.clone()),
@@ -76,12 +75,11 @@ impl AmlDevice {
             ObjectValue::Str(s) => out.push(s.clone()),
             ObjectValue::Int(id) => out.push(eisa_id_to_string(*id)),
             ObjectValue::Buf(bytes) => {
-                // A buffer of packed EISA IDs, one every four bytes.
-                for id in bytes.as_chunks::<4>().0 {
-                    out.push(eisa_id_to_string(u64::from(u32::from_le_bytes(*id))));
+                for chunk in bytes.as_chunks::<4>().0 {
+                    let id = u32::from_le_bytes(*chunk);
+                    out.push(eisa_id_to_string(id.into()));
                 }
             }
-            ObjectValue::Opaque => {}
         }
         out
     }
@@ -96,6 +94,17 @@ impl AmlDevice {
     }
 }
 
+/// The value of a named object declared in the namespace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectValue {
+    /// An ASCII string, e.g. `Name(_HID, "BLTP7853")`.
+    Str(String),
+    /// An integer, e.g. `Name(_STA, 0x0f)`.
+    Int(u64),
+    /// A byte buffer, e.g. the resource template of `_CRS`.
+    Buf(Vec<u8>),
+}
+
 /// Decodes a compressed EISA ID integer into its string form.
 ///
 /// The firmware stores the ID byte-swapped (the first letter lands in the
@@ -104,9 +113,7 @@ impl AmlDevice {
 ///
 /// Reference:
 /// <https://elixir.bootlin.com/linux/v6.16/source/drivers/acpi/acpica/exutils.c>
-/// (`AcpiUtExEisaIdToString` over `acpi_ut_dword_byte_swap`) and
-/// <https://elixir.bootlin.com/linux/v6.16/source/drivers/acpi/scan.c>
-/// (`acpi_eisa_id_to_string`).
+/// (`AcpiUtExEisaIdToString`).
 fn eisa_id_to_string(id: u64) -> String {
     let id = u32::from_le_bytes((id as u32).to_le_bytes()).swap_bytes();
     let mut out = String::with_capacity(8);
@@ -122,367 +129,373 @@ fn eisa_id_to_string(id: u64) -> String {
     out
 }
 
-/// Parses an AML term list and returns the devices it declares, in
-/// declaration order.
-pub(super) fn parse_devices(aml: &[u8]) -> Vec<AmlDevice> {
-    let mut stream = AmlStream::new(aml);
-    let end = stream.end();
+/// Reads an AML PkgLength starting at `pos`. Returns `(length, bytes_used)`.
+///
+/// A PkgLength counts its own encoding bytes: the package it describes
+/// starts at the first length byte and spans exactly `length` bytes. A
+/// single-byte length fills bits 5:0 (up to 63); a multi-byte one puts the
+/// low nibble in bits 3:0 and the remaining bytes, little-endian, above it.
+fn read_pkg_length(data: &[u8], pos: usize) -> Option<(u32, usize)> {
+    if pos >= data.len() {
+        return None;
+    }
+    let lead = data[pos];
+    let extra = ((lead >> 6) & 3) as usize;
+    let length = if extra == 0 {
+        (lead & 0x3f) as u32
+    } else {
+        let mut length = (lead & 0x0f) as u32;
+        for i in 0..extra {
+            let b = *data.get(pos + 1 + i)?;
+            length |= (b as u32) << (4 + i * 8);
+        }
+        length
+    };
+    Some((length, 1 + extra))
+}
+
+/// Reads a four-character name segment starting at `pos`.
+/// NUL and underscore padding is preserved in the output.
+fn read_name_seg(data: &[u8], pos: usize) -> Option<(String, usize)> {
+    if pos + 4 > data.len() {
+        return None;
+    }
+    let mut seg = String::with_capacity(4);
+    for i in 0..4 {
+        let b = data[pos + i];
+        if !(b == 0 || b == b'_' || b.is_ascii_alphanumeric()) {
+            return None;
+        }
+        seg.push(if b == 0 { '_' } else { b as char });
+    }
+    Some((seg, pos + 4))
+}
+
+/// A DeviceOp whose PkgLength, name, and body extent are all plausible.
+type DeviceOp = (usize, usize, usize, String);
+
+/// Finds the next plausible DeviceOp (`5b 82`) in `aml` at or after `from`.
+///
+/// Returns `(op_pos, body_start, body_end, name)` where the body extent
+/// follows the PkgLength and the name is a valid NameSeg. A `5b 82` pair
+/// that fails any check is coincidental data; the scan resumes right after
+/// the two pattern bytes rather than trusting its PkgLength.
+fn next_device_op(aml: &[u8], from: usize) -> Option<DeviceOp> {
+    let mut pos = from;
+    while pos + 1 < aml.len() {
+        if aml[pos] == 0x5b && aml[pos + 1] == 0x82 {
+            let op = try_device_op(aml, pos);
+            if op.is_some() {
+                return op;
+            }
+        }
+        pos += 1;
+    }
+    None
+}
+
+/// Validates the DeviceOp pattern at `pos`, where the `5b` byte sits.
+fn try_device_op(aml: &[u8], pos: usize) -> Option<DeviceOp> {
+    let (length, len_bytes) = read_pkg_length(aml, pos + 2)?;
+    let name_start = pos + 2 + len_bytes;
+    let body_start = name_start + 4;
+    let body_end = pos + 2 + length as usize;
+    if body_end > aml.len() || body_end <= body_start {
+        return None;
+    }
+    let (name, _) = read_name_seg(aml, name_start)?;
+    Some((pos, body_start, body_end, name))
+}
+
+/// Parses an AML stream and returns the devices it declares, in declaration
+/// order with nested devices following their parent.
+pub fn parse_devices(aml: &[u8]) -> Vec<AmlDevice> {
     let mut devices = Vec::new();
-    let _ = walk_term_list(&mut stream, end, "", &mut devices);
+    // The (body_end, path) of every open enclosing device, innermost last.
+    let mut scopes: Vec<(usize, String)> = Vec::new();
+    let mut from = 0;
+    while let Some((op_pos, body_start, body_end, name)) = next_device_op(aml, from) {
+        // Close every enclosing device whose body ended before this one.
+        while scopes.last().is_some_and(|&(end, _)| end <= op_pos) {
+            scopes.pop();
+        }
+        let (parent, path) = match scopes.last() {
+            Some((_, parent)) => (Some(parent.clone()), format!("{parent}.{name}")),
+            None => (None, format!("\\_SB.{name}")),
+        };
+        // Named objects of this device stop where a nested device begins;
+        // the nested device is picked up by the scan in the next iteration.
+        let scan_end = next_device_op(aml, body_start)
+            .map_or(body_end, |(nested_pos, ..)| nested_pos.min(body_end));
+        let mut objects = BTreeMap::new();
+        scan_named_objects(aml, body_start, scan_end, &mut objects);
+        devices.push(AmlDevice {
+            name,
+            path: path.clone(),
+            parent,
+            objects,
+        });
+        scopes.push((body_end, path));
+        from = op_pos + 2;
+    }
     devices
 }
 
-/// Walks a term list from the current position to `end`, collecting the
-/// devices it declares into `devices`.
-///
-/// `scope_path` is the absolute path of the enclosing scope (empty for the
-/// root). The device whose body is currently being walked is held in
-/// `current` and flushed into `devices` when its term list ends or when a
-/// nested device begins.
-///
-/// Returns `Err` when an unknown term forces the walk to stop; the devices
-/// collected up to that point remain valid.
-fn walk_term_list(
-    stream: &mut AmlStream,
+/// Collects the named objects declared in `[start, end)`, which spans the
+/// body of one device and stops before any nested device.
+fn scan_named_objects(
+    aml: &[u8],
+    start: usize,
     end: usize,
-    scope_path: &str,
-    devices: &mut Vec<AmlDevice>,
-) -> Result<(), AmlError> {
-    // The device whose body is currently being walked, together with the end
-    // of that body. Held locally so that the borrow of `devices` stays
-    // exclusive.
-    let mut current: Option<(AmlDevice, usize)> = None;
-    while stream.pos() < end {
-        // Close a device whose body has ended before interpreting the next
-        // term, so that later objects are not attributed to it.
-        if let Some((_, dev_end)) = &current
-            && stream.pos() >= *dev_end
-        {
-            flush(&mut current, devices);
-        }
-        let op = stream.peek().ok_or(AmlError::UnexpectedEnd)?;
-        match op {
-            opcode::SCOPE => {
-                flush(&mut current, devices);
-                let body_end = open_pkg_body(stream, end)?;
-                let name = stream.read_name_string()?;
-                let child_path = join_path(scope_path, &name);
-                walk_term_list(stream, body_end, child_path.as_str(), devices)?;
-                stream.set_pos(body_end);
-            }
-            opcode::EXT_PREFIX => {
-                // Consume the prefix byte; `peek` above did not advance.
-                stream.read_u8()?;
-                let ext = stream.read_u8()?;
-                match ext {
-                    opcode::EXT_DEVICE => {
-                        flush(&mut current, devices);
-                        let body_end = open_pkg_body_after_ext(stream, end)?;
-                        let name = stream.read_name_string()?;
-                        let path = join_path(scope_path, &name);
-                        current = Some((
-                            AmlDevice {
-                                name,
-                                path,
-                                objects: BTreeMap::new(),
-                            },
-                            body_end,
-                        ));
+    objects: &mut BTreeMap<String, ObjectValue>,
+) {
+    // Methods whose body is exactly `Return(<name>)`, resolved after the
+    // scan so that declaration order does not matter.
+    let mut returns: Vec<(String, String)> = Vec::new();
+    let mut pos = start;
+    while pos < end {
+        match aml[pos] {
+            0x08 => {
+                let Some((name, value, next)) = (|| {
+                    if pos + 5 > end {
+                        return None;
                     }
-                    opcode::EXT_METHOD => {
-                        let body_end = open_pkg_body_after_ext(stream, end)?;
-                        let name = stream.read_name_string()?;
-                        let _flags = stream.read_u8()?;
-                        // A method body that simply returns a named object is
-                        // resolved to that object's declared value; anything
-                        // else is skipped whole.
-                        if body_end == stream.pos() + 1 + 4
-                            && stream.peek() == Some(opcode::RETURN)
-                            && current.is_some()
-                        {
-                            stream.read_u8()?;
-                            let reference = stream.read_name_string()?;
-                            let value = current
-                                .as_ref()
-                                .and_then(|(device, _)| device.objects.get(&reference).cloned());
-                            if let (Some(value), Some((device, _))) = (value, current.as_mut()) {
-                                device.objects.insert(name, value);
-                            }
-                        }
-                        stream.set_pos(body_end);
+                    let obj_name = &aml[pos + 1..pos + 5];
+                    if !obj_name
+                        .iter()
+                        .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+                    {
+                        return None;
                     }
-                    // Field-like and container terms have fixed structure but
-                    // no objects we care about; they are package-wrapped, so
-                    // skip them whole.
-                    opcode::EXT_FIELD
-                    | opcode::EXT_INDEX_FIELD
-                    | opcode::EXT_BANK_FIELD
-                    | opcode::EXT_DATA_REGION
-                    | opcode::EXT_OPERATION_REGION
-                    | opcode::EXT_POWER_RES
-                    | opcode::EXT_THERMAL_ZONE
-                    | opcode::EXT_PROCESSOR
-                    | opcode::EXT_MUTEX
-                    | opcode::EXT_EVENT => {
-                        skip_pkg_body(stream, end)?;
-                    }
-                    _ => return Err(AmlError::UnexpectedEnd),
-                }
+                    let (value, next) = parse_object_value(aml, pos + 5, end)?;
+                    Some((
+                        core::str::from_utf8(obj_name).ok()?.to_string(),
+                        value,
+                        next,
+                    ))
+                })() else {
+                    pos += 1;
+                    continue;
+                };
+                objects.insert(name, value);
+                pos = next;
             }
-            opcode::NAME => {
-                stream.read_u8()?;
-                let name = stream.read_name_string()?;
-                let value = parse_data_object(stream)?;
-                if let Some((device, _)) = current.as_mut() {
-                    device.objects.insert(name, value);
-                }
+            0x14 => {
+                let Some((name, reference, pkg_end)) = try_trivial_return_method(aml, pos, end)
+                else {
+                    // A method whose body is anything else is skipped whole:
+                    // its bytes are executable code, not namespace data.
+                    pos += 1;
+                    continue;
+                };
+                returns.push((name, reference));
+                pos = pkg_end;
             }
-            opcode::RETURN => {
-                stream.read_u8()?;
-                parse_data_object(stream)?;
-            }
-            // Control flow that may wrap devices and scopes; `While` bodies
-            // are skipped whole because a static walk must not loop.
-            0xa0..=0xa2 => {
-                skip_pkg_body(stream, end)?;
-            }
-            // `Noop`, `Break`, `BreakPoint`: single-byte statements.
-            0xa3 | 0x9f | 0xcc => {
-                stream.read_u8()?;
-            }
-            _ => return Err(AmlError::UnexpectedEnd),
+            _ => pos += 1,
         }
     }
-    flush(&mut current, devices);
-    Ok(())
-}
-
-/// Moves a finished device into the device list.
-fn flush(current: &mut Option<(AmlDevice, usize)>, devices: &mut Vec<AmlDevice>) {
-    if let Some((device, _)) = current.take() {
-        devices.push(device);
+    for (name, reference) in returns {
+        if let Some(value) = objects.get(&reference) {
+            let value = value.clone();
+            objects.insert(name, value);
+        }
     }
 }
 
-/// Reads a data object: the value forms a `NameOp` may legally carry.
-fn parse_data_object(stream: &mut AmlStream) -> Result<ObjectValue, AmlError> {
-    match stream.peek().ok_or(AmlError::UnexpectedEnd)? {
-        opcode::ZERO => {
-            stream.read_u8()?;
-            Ok(ObjectValue::Int(0))
-        }
-        0x01 => {
-            stream.read_u8()?;
-            Ok(ObjectValue::Int(1))
-        }
-        0xff => {
-            stream.read_u8()?;
-            Ok(ObjectValue::Int(u64::MAX))
-        }
-        opcode::BYTE_CONST_PREFIX => {
-            stream.read_u8()?;
-            Ok(ObjectValue::Int(stream.read_int(1)?))
-        }
-        0x0b => {
-            stream.read_u8()?;
-            Ok(ObjectValue::Int(stream.read_int(2)?))
-        }
-        0x0c => {
-            stream.read_u8()?;
-            Ok(ObjectValue::Int(stream.read_int(4)?))
-        }
-        0x0e => {
-            stream.read_u8()?;
-            Ok(ObjectValue::Int(stream.read_int(8)?))
-        }
-        opcode::STRING_PREFIX => {
-            stream.read_u8()?;
-            let mut string = String::new();
-            loop {
-                let byte = stream.read_u8()?;
-                if byte == 0 {
-                    break;
-                }
-                string.push(byte as char);
-            }
-            Ok(ObjectValue::Str(string))
-        }
-        opcode::BUFFER => {
-            let body_end = open_pkg_body(stream, stream.end())?;
-            // Skip the BufferSize term; the remaining bytes of the package
-            // body are the buffer contents.
-            let _ = parse_data_object(stream)?;
-            let len = body_end.saturating_sub(stream.pos());
-            let bytes = stream.read_bytes(len)?;
-            Ok(ObjectValue::Buf(bytes))
-        }
-        // Packages and expressions are not modeled; consume nothing and
-        // report the value as opaque.
-        _ => Ok(ObjectValue::Opaque),
+/// Recognizes `Method(NameSeg, Flags) { Return(NameString) }` at `pos`,
+/// the accessor firmware emits for a static resource template. Returns the
+/// method name, the referenced object name, and the end of the package.
+fn try_trivial_return_method(
+    aml: &[u8],
+    pos: usize,
+    limit: usize,
+) -> Option<(String, String, usize)> {
+    let (pkg_len, len_bytes) = read_pkg_length(aml, pos + 1)?;
+    let pkg_end = pos + 1 + pkg_len as usize;
+    if pkg_end > limit {
+        return None;
     }
+    let (name, name_end) = read_name_seg(aml, pos + 1 + len_bytes)?;
+    // One flags byte separates the name from the term list.
+    let body_start = name_end + 1;
+    if body_start >= pkg_end || aml[body_start] != 0xa4 {
+        return None;
+    }
+    // The returned NameString may carry root/caret prefixes.
+    let mut ref_pos = body_start + 1;
+    while ref_pos < pkg_end && matches!(aml[ref_pos], 0x5c | 0x5e) {
+        ref_pos += 1;
+    }
+    let (reference, ref_end) = read_name_seg(aml, ref_pos)?;
+    if ref_end != pkg_end {
+        return None;
+    }
+    Some((name, reference, pkg_end))
 }
 
-/// Opens a package-wrapped term: consumes the opcode (one or two bytes),
-/// reads the package length, and returns the absolute end position of the
-/// package body. The body immediately follows the length and ends at the
-/// returned position.
+/// Parses the value of a named object at `pos`, bounded by `limit`.
 ///
-/// `limit` is the end of the enclosing term list; a package that would
-/// extend past it is malformed.
-fn open_pkg_body(stream: &mut AmlStream, limit: usize) -> Result<usize, AmlError> {
-    let is_extended = stream.peek() == Some(opcode::EXT_PREFIX);
-    let header = if is_extended { 2 } else { 1 };
-    stream.read_u8()?;
-    if is_extended {
-        stream.read_u8()?;
+/// Returns the value and the position just past it. Every read is
+/// bounds-checked against the stream and the enclosing device body; a
+/// value that does not fit yields `None` rather than a panic.
+fn parse_object_value(aml: &[u8], pos: usize, limit: usize) -> Option<(ObjectValue, usize)> {
+    let int_at = |pos: usize, width: usize| -> Option<u64> {
+        if pos + width > limit {
+            return None;
+        }
+        let bytes: [u8; 8] = aml.get(pos..pos + width)?.try_into().ok()?;
+        Some(u64::from_le_bytes(bytes))
+    };
+    match *aml.get(pos)? {
+        0x00 => Some((ObjectValue::Int(0), pos + 1)),
+        0x01 => Some((ObjectValue::Int(1), pos + 1)),
+        0x0a => Some((ObjectValue::Int(int_at(pos + 1, 1)?), pos + 2)),
+        0x0b => Some((ObjectValue::Int(int_at(pos + 1, 2)?), pos + 3)),
+        0x0c => Some((ObjectValue::Int(int_at(pos + 1, 4)?), pos + 5)),
+        0x0e => Some((ObjectValue::Int(int_at(pos + 1, 8)?), pos + 9)),
+        0x0d => {
+            // String: NUL-terminated within the enclosing body.
+            if pos + 1 >= limit {
+                return None;
+            }
+            let end = aml.get(pos + 1..limit)?.iter().position(|&b| b == 0)? + pos + 1;
+            let s = core::str::from_utf8(aml.get(pos + 1..end)?).ok()?;
+            Some((ObjectValue::Str(s.to_string()), end + 1))
+        }
+        0x11 => {
+            // Buffer: `11 PkgLength BufferSize ByteList`. The PkgLength
+            // counts its own bytes, so the data starts after the BufferSize
+            // term and ends where the package does.
+            let (pkg_len, len_bytes) = read_pkg_length(aml, pos + 1)?;
+            let body_start = pos + 1 + len_bytes;
+            let body_end = (pos + 1 + pkg_len as usize).min(limit);
+            let size_len = match *aml.get(body_start)? {
+                0x00 | 0x01 => 1,
+                0x0a => 2,
+                0x0b => 3,
+                0x0c => 5,
+                0x0e => 9,
+                _ => return None,
+            };
+            let data_start = body_start + size_len;
+            if data_start > body_end {
+                return None;
+            }
+            Some((
+                ObjectValue::Buf(aml[data_start..body_end].to_vec()),
+                body_end,
+            ))
+        }
+        _ => None,
     }
-    let length = stream.read_pkg_length()? as usize;
-    if length < header {
-        return Err(AmlError::InvalidPkgLength);
-    }
-    let start = stream.pos();
-    let end = start - header + length;
-    if end > limit {
-        return Err(AmlError::UnexpectedEnd);
-    }
-    Ok(end)
-}
-
-/// Opens an extended (two-byte opcode) package whose opcode has already
-/// been consumed: reads the package length and returns the absolute end
-/// position of the package body.
-fn open_pkg_body_after_ext(stream: &mut AmlStream, limit: usize) -> Result<usize, AmlError> {
-    let length_pos = stream.pos();
-    let length = stream.read_pkg_length()? as usize;
-    // The length covers the package length bytes themselves and the body.
-    let end = length_pos + length;
-    if end > limit {
-        return Err(AmlError::UnexpectedEnd);
-    }
-    Ok(end)
-}
-
-/// Skips a package-wrapped term entirely.
-fn skip_pkg_body(stream: &mut AmlStream, limit: usize) -> Result<(), AmlError> {
-    open_pkg_body(stream, limit)?;
-    Ok(())
-}
-
-/// Joins a namespace path onto a scope path.
-fn join_path(scope: &str, name: &str) -> String {
-    if name.starts_with('\\') {
-        return name.to_string();
-    }
-    let mut path = String::with_capacity(scope.len() + 1 + name.len());
-    path.push_str(scope);
-    if !path.is_empty() && !path.ends_with('.') {
-        path.push('.');
-    }
-    path.push_str(name);
-    path
 }
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
-
     use super::*;
 
-    /// Wraps a device body into a `DeviceOp`: opcode, package length, name,
-    /// body. The package length covers the name, the body, and its own two
-    /// bytes, but not the two opcode bytes.
-    fn device_op(name: &[u8; 4], body: &[u8]) -> Vec<u8> {
-        let mut out = vec![opcode::EXT_PREFIX, opcode::EXT_DEVICE];
-        let len = body.len() + name.len() + 2;
-        out.push(0x40 | (len & 0x0f) as u8);
-        out.push((len >> 4) as u8);
-        out.extend_from_slice(name);
-        out.extend_from_slice(body);
-        out
-    }
+    /// The byte-exact declaration of the I2C controller `I2CA`, its nested
+    /// touchpad `TPD0`, and the start of the sibling controller `I2CB`, as
+    /// found in the DSDT of a Hygon laptop.
+    const HYGON_I2CA_TPD0: &[u8] = &[
+        0x5b, 0x82, 0x4c, 0x14, 0x49, 0x32, 0x43, 0x41, 0x08, 0x5f, 0x48, 0x49, 0x44, 0x0d, 0x48,
+        0x59, 0x47, 0x4f, 0x30, 0x30, 0x31, 0x30, 0x00, 0x08, 0x5f, 0x55, 0x49, 0x44, 0x00, 0x08,
+        0x5f, 0x43, 0x52, 0x53, 0x11, 0x15, 0x0a, 0x12, 0x23, 0x00, 0x04, 0x01, 0x86, 0x09, 0x00,
+        0x01, 0x00, 0x20, 0xdc, 0xfe, 0x00, 0x10, 0x00, 0x00, 0x79, 0x00, 0x14, 0x0b, 0x5f, 0x53,
+        0x54, 0x41, 0x00, 0xa4, 0x49, 0x43, 0x41, 0x45, 0x5b, 0x82, 0x48, 0x10, 0x54, 0x50, 0x44,
+        0x30, 0x08, 0x5f, 0x48, 0x49, 0x44, 0x0d, 0x42, 0x4c, 0x54, 0x50, 0x37, 0x38, 0x35, 0x33,
+        0x00, 0x08, 0x5f, 0x43, 0x49, 0x44, 0x0d, 0x50, 0x4e, 0x50, 0x30, 0x43, 0x35, 0x30, 0x00,
+        0x14, 0x09, 0x5f, 0x53, 0x54, 0x41, 0x00, 0xa4, 0x0a, 0x0f, 0x08, 0x53, 0x43, 0x43, 0x47,
+        0x11, 0x45, 0x04, 0x0a, 0x41, 0x8e, 0x19, 0x00, 0x01, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01,
+        0x06, 0x00, 0x80, 0x1a, 0x06, 0x00, 0x2c, 0x00, 0x5c, 0x5f, 0x53, 0x42, 0x2e, 0x49, 0x32,
+        0x43, 0x41, 0x00, 0x8c, 0x20, 0x00, 0x01, 0x00, 0x01, 0x00, 0x12, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x17, 0x00, 0x00, 0x19, 0x00, 0x23, 0x00, 0x00, 0x00, 0x09, 0x00, 0x5c, 0x5f,
+        0x53, 0x42, 0x2e, 0x47, 0x50, 0x49, 0x41, 0x00, 0x79, 0x00, 0x14, 0x0b, 0x5f, 0x43, 0x52,
+        0x53, 0x00, 0xa4, 0x53, 0x43, 0x43, 0x47, 0x14, 0x43, 0x08, 0x5f, 0x44, 0x53, 0x4d, 0x04,
+        0xa0, 0x3e, 0x93, 0x68, 0x11, 0x13, 0x0a, 0x10, 0xf7, 0xf6, 0xdf, 0x3c, 0x67, 0x42, 0x55,
+        0x45, 0xad, 0x05, 0xb3, 0x0a, 0x3d, 0x89, 0x38, 0xde, 0xa0, 0x15, 0x93, 0x6a, 0x00, 0xa0,
+        0x09, 0x93, 0x69, 0x01, 0xa4, 0x11, 0x03, 0x01, 0x03, 0xa1, 0x06, 0xa4, 0x11, 0x03, 0x01,
+        0x00, 0xa1, 0x10, 0xa0, 0x07, 0x93, 0x6a, 0x01, 0xa4, 0x0a, 0x20, 0xa1, 0x06, 0xa4, 0x11,
+        0x03, 0x01, 0x00, 0xa1, 0x3c, 0xa0, 0x33, 0x93, 0x68, 0x11, 0x13, 0x0a, 0x10, 0x82, 0xeb,
+        0x87, 0xef, 0x51, 0xf9, 0xda, 0x46, 0x84, 0xec, 0x14, 0x87, 0x1a, 0xc6, 0xf8, 0x4b, 0xa0,
+        0x0e, 0x93, 0x6a, 0x00, 0xa0, 0x09, 0x93, 0x69, 0x01, 0xa4, 0x11, 0x03, 0x01, 0x03, 0xa0,
+        0x07, 0x93, 0x6a, 0x01, 0xa4, 0x0a, 0x20, 0xa4, 0x11, 0x03, 0x01, 0x00, 0xa1, 0x06, 0xa4,
+        0x11, 0x03, 0x01, 0x00, 0x5b, 0x82, 0x42, 0x04, 0x49, 0x32, 0x43, 0x42, 0x08, 0x5f, 0x48,
+        0x49, 0x44, 0x0d, 0x48, 0x59, 0x47, 0x4f, 0x30, 0x30, 0x31, 0x30, 0x00, 0x08, 0x5f, 0x55,
+        0x49, 0x44, 0x01, 0x08, 0x5f, 0x43, 0x52, 0x53, 0x11, 0x15, 0x0a, 0x12, 0x23, 0x00, 0x08,
+        0x01, 0x86, 0x09, 0x00, 0x01, 0x00, 0x30, 0xdc, 0xfe, 0x00, 0x10, 0x00, 0x00, 0x79, 0x00,
+        0x14, 0x0b, 0x5f, 0x53, 0x54, 0x41, 0x00, 0xa4, 0x49, 0x43, 0x42, 0x45, 0x5b, 0x82,
+    ];
 
-    /// Wraps a value into a `NameOp` with the given four-character name.
-    fn name_op(name: &[u8; 4], value: &[u8]) -> Vec<u8> {
-        let mut out = vec![opcode::NAME];
-        out.extend_from_slice(name);
-        out.extend_from_slice(value);
-        out
+    /// A DeviceOp whose body ends inside a NameOp value: the buffer's
+    /// decoded data would start past the end of the enclosing body. The
+    /// parser must reject the value instead of slicing a reversed range.
+    const GARBAGE_DEVICE_OP: &[u8] = &[
+        0x5b, 0x82, 0x0a, 0x43, 0x30, 0x30, 0x30, // Device C000, 10-byte package
+        0x08, 0x5f, 0x48, 0x49, 0x44, // NameOp `_HID` ...
+        0x11, 0x09, 0x0a, 0xff, // ... whose value is a Buffer sticking out
+    ];
+
+    #[test]
+    fn parses_nested_touchpad_with_method_crs() {
+        let devices = parse_devices(HYGON_I2CA_TPD0);
+        let paths: Vec<_> = devices.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, ["\\_SB.I2CA", "\\_SB.I2CA.TPD0", "\\_SB.I2CB"]);
+
+        let controller = &devices[0];
+        assert_eq!(controller.parent, None);
+        assert_eq!(controller.hid().as_deref(), Some("HYGO0010"));
+        assert!(controller.cids().is_empty());
+        // The controller template: an IRQ and a 4 KiB fixed memory range.
+        let crs = controller.crs_buffer().unwrap();
+        assert_eq!(
+            crs,
+            &[
+                0x23, 0x00, 0x04, 0x01, 0x86, 0x09, 0x00, 0x01, 0x00, 0x20, 0xdc, 0xfe, 0x00, 0x10,
+                0x00, 0x00, 0x79, 0x00
+            ]
+        );
+
+        let touchpad = &devices[1];
+        // The touchpad is a child of its controller: this is the bus
+        // attachment, matching the display-form source string of the
+        // serial bus resource.
+        assert_eq!(touchpad.parent.as_deref(), Some("\\_SB.I2CA"));
+        assert_eq!(touchpad.hid().as_deref(), Some("BLTP7853"));
+        assert_eq!(touchpad.cids(), ["PNP0C50"]);
+        // The template comes from `Method(_CRS) { Return(SCCG) }`.
+        let crs = touchpad.crs_buffer().unwrap();
+        assert_eq!(&crs[..3], &[0x8e, 0x19, 0x00]);
+        assert_eq!(&crs[crs.len() - 2..], &[0x79, 0x00]);
+        assert_eq!(crs.len(), 65);
+        // The slave address and the resource source string of the bus.
+        assert_eq!(&crs[16..18], &[0x2c, 0x00]);
+        assert_eq!(&crs[18..28], b"\\_SB.I2CA\x00");
     }
 
     #[test]
-    fn parses_device_with_static_crs() {
-        // Device(I2CA) {
-        //   Name(_HID, "HYGO0010")
-        //   Name(_CRS, Buffer { irq, fixed memory 32, end tag })
-        // }
-        let mut body = name_op(b"_HID", &[opcode::STRING_PREFIX]);
-        body.extend_from_slice(b"HYGO0010\0");
-        body.extend_from_slice(&name_op(b"_CRS", &[opcode::BUFFER, 0x16, 0x0a, 0x12]));
-        body.extend_from_slice(&[
-            0x23, 0x00, 0x04, 0x01, // IRQ: mask 0x0400, edge/active-high
-            0x86, 0x09, 0x00, // Memory32Fixed, length 9
-            0x00, 0x01, // write status, write type
-            0x00, 0x20, 0xdc, 0xfe, // base address 0xfedc2000
-            0x00, 0x10, 0x00, 0x00, // length 0x1000
-            0x79, 0x00, // EndTag
-        ]);
-        let aml = device_op(b"I2CA", &body);
-
-        let devices = parse_devices(&aml);
+    fn rejects_garbage_device_op_without_panicking() {
+        let devices = parse_devices(GARBAGE_DEVICE_OP);
+        // The name is a plausible NameSeg, so the device is kept, but the
+        // `_HID` value that sticks out of the body is dropped.
         assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].name, "I2CA");
-        assert_eq!(devices[0].hid().as_deref(), Some("HYGO0010"));
-        assert_eq!(devices[0].crs_buffer().unwrap().len(), 19);
+        assert_eq!(devices[0].name, "C000");
+        assert!(devices[0].hid().is_none());
     }
 
     #[test]
-    fn resolves_method_returning_named_object() {
-        // Device(TPD0) {
-        //   Name(_HID, "BLTP7853"), Name(_CID, "PNP0C50"),
-        //   Name(SCCG, Buffer { ... }),
-        //   Method(_CRS) { Return(SCCG) },
-        // }
-        let mut body = name_op(b"_HID", &[opcode::STRING_PREFIX]);
-        body.extend_from_slice(b"BLTP7853\0");
-        body.extend_from_slice(&name_op(b"_CID", &[opcode::STRING_PREFIX]));
-        body.extend_from_slice(b"PNP0C50\0");
-        body.extend_from_slice(&name_op(b"SCCG", &[opcode::BUFFER, 0x2b, 0x0a, 0x28]));
-        body.extend_from_slice(&[0x28; 40]);
-        // Method(_CRS, 0) { Return(SCCG) }.
-        body.extend_from_slice(&[
-            opcode::EXT_PREFIX,
-            opcode::EXT_METHOD,
-            0x0b,
-            b'_',
-            b'C',
-            b'R',
-            b'S',
-            0x00,
-            opcode::RETURN,
-            b'S',
-            b'C',
-            b'C',
-            b'G',
-        ]);
-        let aml = device_op(b"TPD0", &body);
-
-        let devices = parse_devices(&aml);
+    fn resolves_trivial_return_regardless_of_declaration_order() {
+        // `_CRS` references the buffer before the buffer is declared.
+        let aml: &[u8] = &[
+            0x5b, 0x82, 0x20, 0x54, 0x45, 0x53, 0x54, // Device TEST
+            0x14, 0x0b, 0x5f, 0x43, 0x52, 0x53, 0x00, 0xa4, 0x42, 0x55, 0x46, 0x41, 0x08, 0x42,
+            0x55, 0x46, 0x41, 0x11, 0x09, 0x0a, 0x04, 0x11, 0x22, 0x33, 0x44, 0x79, 0x00,
+        ];
+        let devices = parse_devices(aml);
         assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].cids(), vec!["PNP0C50".to_string()]);
-        // The `_CRS` method resolved to the `SCCG` buffer.
-        assert_eq!(&devices[0].crs_buffer().unwrap()[..5], &[0x28; 5]);
-    }
-
-    #[test]
-    fn unknown_term_stops_the_walk_but_keeps_devices() {
-        // A device followed by a byte the walker does not understand.
-        let mut body = name_op(b"_HID", &[opcode::STRING_PREFIX]);
-        body.extend_from_slice(b"HYGO0010\0");
-        let mut aml = device_op(b"I2CA", &body);
-        aml.push(0x77);
-
-        let devices = parse_devices(&aml);
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].hid().as_deref(), Some("HYGO0010"));
+        assert_eq!(
+            devices[0].crs_buffer(),
+            Some(&[0x11, 0x22, 0x33, 0x44, 0x79, 0x00][..])
+        );
     }
 }

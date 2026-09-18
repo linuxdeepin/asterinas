@@ -18,8 +18,6 @@
 
 extern crate alloc;
 
-pub mod pkg;
-
 use alloc::vec::Vec;
 
 mod namespace;

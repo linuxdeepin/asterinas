@@ -40,7 +40,7 @@ struct TouchpadSlot {
 /// device.
 pub(super) fn start() {
     if STARTED.swap(true, Ordering::AcqRel) {
-        ostd::info!("probe already started");
+        ostd::debug!("the touchpad probe is already running");
         return;
     }
     aster_core::spawn_kernel_thread(|| {
@@ -48,14 +48,21 @@ pub(super) fn start() {
             ostd::info!("touchpad active");
         } else {
             STARTED.store(false, Ordering::Release);
-            ostd::info!("no touchpad activated; the probe can be started again");
+            ostd::debug!("no touchpad activated; the probe can be started again");
         }
     });
 }
 
+fn aml_len() -> usize {
+    dsdt_aml_bytes().map_or(0, <[u8]>::len)
+}
+
 fn init() -> bool {
     let Some(aml) = dsdt_aml_bytes() else {
-        ostd::info!("no DSDT available, skipping touchpad probe");
+        ostd::debug!(
+            "no DSDT available ({} bytes total), skipping touchpad probe",
+            aml_len()
+        );
         return false;
     };
 
@@ -83,14 +90,14 @@ fn init() -> bool {
         };
 
         let Some(layout) = parse_mouse_report(device.report_descriptor()) else {
-            ostd::warn!(
+            ostd::debug!(
                 "probe {}: no relative mouse report found, skipping",
                 probe_name
             );
             continue;
         };
 
-        ostd::info!(
+        ostd::debug!(
             "probe {}: vendor={:#06x} product={:#06x}, mouse report id={}, {} fields",
             probe_name,
             device.descriptor().vendor_id,
@@ -108,22 +115,12 @@ fn init() -> bool {
     activated
 }
 
-/// Normalizes a namespace path for comparison: drops the root and prefix
-/// markers and strips the underscore padding of every name segment.
-fn normalize_path(path: &str) -> String {
-    path.trim_start_matches(['\\', '^'])
-        .split('.')
-        .map(|segment| segment.trim_end_matches('_'))
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
 /// Enumerates the HID-over-I2C touchpads described by the DSDT.
 ///
 /// Every touchpad declares its bus attachment with an `I2cSerialBusV2`
-/// resource, whose slave address and resource source string name the device
-/// address and the bus controller; the controller's own `_CRS` carries the
-/// MMIO window of its DesignWare IP.
+/// resource, whose slave address names the device address; the bus
+/// controller is the touchpad's enclosing device, and its own `_CRS`
+/// carries the MMIO window of the DesignWare IP.
 ///
 /// Reference:
 /// <https://elixir.bootlin.com/linux/v6.16/source/drivers/i2c/i2c-core-acpi.c>
@@ -141,50 +138,51 @@ fn enumerate(aml: &[u8]) -> Vec<TouchpadSlot> {
         }
 
         let Some(crs) = device.crs_buffer() else {
-            ostd::warn!("device {} has no _CRS, skipping", device.path);
+            ostd::warn!("touchpad {} has no _CRS buffer, skipping", device.path);
             continue;
         };
 
-        let serial_bus =
-            parse_resource_buffer(crs)
-                .into_iter()
-                .find_map(|resource| match resource {
-                    Resource::I2cSerialBus {
-                        slave_address,
-                        controller_path,
-                    } => Some((slave_address, controller_path)),
-                    _ => None,
-                });
-        let Some((slave_address, controller_path)) = serial_bus else {
+        let Some((slave_address, controller_path)) = parse_resource_buffer(crs)
+            .into_iter()
+            .find_map(|resource| match resource {
+                Resource::I2cSerialBus {
+                    slave_address,
+                    controller_path,
+                } => Some((slave_address, controller_path)),
+                _ => None,
+            })
+        else {
             ostd::warn!(
-                "device {} has no I2C serial bus resource, skipping",
-                device.path
+                "touchpad {}: no I2cSerialBusV2 resource found in {} bytes of _CRS, skipping",
+                device.path,
+                crs.len()
             );
             continue;
         };
 
         let Ok(slave_address) = u8::try_from(slave_address) else {
             ostd::warn!(
-                "device {} has an out-of-range address, skipping",
+                "touchpad {} has an out-of-range address, skipping",
                 device.path
             );
             continue;
         };
 
-        // The touchpad hangs off the controller named by the resource source
-        // string; the controller's own `_CRS` describes its MMIO window. The
-        // source string uses the display form (`\_SB.I2CA`) while namespace
-        // paths keep the segment padding (`\_SB__.I2CA`), so both sides are
-        // normalized before comparing — Linux resolves either form through
-        // `acpi_get_handle`.
-        let wanted = normalize_path(&controller_path);
-        let Some(controller) = all_devices.iter().find(|candidate| {
-            normalize_path(&candidate.path) == wanted && candidate.crs_buffer().is_some()
-        }) else {
+        // The controller that owns the touchpad is its enclosing device,
+        // exactly how Linux attaches the client: firmware nests the
+        // touchpad under its I2C controller, and enumeration walks the
+        // controller's children.
+        let controller = device.parent.as_deref().and_then(|parent_path| {
+            all_devices
+                .iter()
+                .find(|candidate| candidate.path == parent_path)
+        });
+        let Some(controller) = controller.filter(|candidate| candidate.crs_buffer().is_some())
+        else {
             ostd::warn!(
-                "controller {} of device {} was not found, skipping",
-                controller_path,
-                device.path
+                "touchpad {}: controller {} not found among the DSDT devices, skipping",
+                device.path,
+                controller_path
             );
             continue;
         };
@@ -192,15 +190,16 @@ fn enumerate(aml: &[u8]) -> Vec<TouchpadSlot> {
         let Some(crs) = controller.crs_buffer() else {
             continue;
         };
-        let memory = parse_resource_buffer(crs)
-            .into_iter()
-            .find_map(|resource| match resource {
-                Resource::Memory32Fixed { base, length } => Some((base, length)),
-                _ => None,
-            });
-        let Some((base, length)) = memory else {
+        let Some((base, length)) =
+            parse_resource_buffer(crs)
+                .into_iter()
+                .find_map(|resource| match resource {
+                    Resource::Memory32Fixed { base, length } => Some((base, length)),
+                    _ => None,
+                })
+        else {
             ostd::warn!(
-                "controller {} has no fixed memory range, skipping",
+                "controller {} has no Memory32Fixed in _CRS, skipping",
                 controller.path
             );
             continue;
